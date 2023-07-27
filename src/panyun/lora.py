@@ -24,45 +24,32 @@ from peft import (
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.trainer_callback import TrainerCallback
 IGNORE_INDEX = -100
-ALPACA_PROMPT_DICT = {
-    "prompt_input": (
-        "Below is an instruction that describes a task, paired with an input that provides further context. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response: "
-    ),
-    "prompt_no_input": (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response: "
-    ),
-}
-
 def check_and_fix_special_tokens(
     tokenizer: transformers.PreTrainedTokenizer,
     model: transformers.PreTrainedModel,
 ):
-    print(f" token class ,tokens vocab :{len(tokenizer.get_vocab())}\n {tokenizer}")
+    logging.info(f" token class ,tokens vocab :{len(tokenizer.get_vocab())}\n {tokenizer}")
     default_pad = "[PAD]"
     default_pad=   default_pad if tokenizer.pad_token is None else tokenizer.pad_token     
     if len(tokenizer.get_vocab())==32000:
        added=tokenizer.add_special_tokens({'pad_token': default_pad})
-       print(f"add pad token because tokenizer size is {len(tokenizer.get_vocab())},added={added}") 
-    print(f'{tokenizer.bos_token=} ,bos_token_id={tokenizer.bos_token_id}')
-    print(f'{tokenizer.eos_token=} ,eos_token_id={tokenizer.eos_token_id}')
-    print(f'{tokenizer.pad_token=} ,pad_token_id={tokenizer.pad_token_id}')
-    print(f'{tokenizer.unk_token=} ,unk_token_id={tokenizer.unk_token_id}')
-    print(f'{tokenizer.all_special_tokens=}')
+       logging.info(f"add pad token because tokenizer size is {len(tokenizer.get_vocab())},added={added}") 
+    logging.info(f'{tokenizer.bos_token=} ,bos_token_id={tokenizer.bos_token_id}')
+    logging.info(f'{tokenizer.eos_token=} ,eos_token_id={tokenizer.eos_token_id}')
+    logging.info(f'{tokenizer.pad_token=} ,pad_token_id={tokenizer.pad_token_id}')
+    logging.info(f'{tokenizer.unk_token=} ,unk_token_id={tokenizer.unk_token_id}')
+    logging.info(f'{tokenizer.all_special_tokens=}')
     #tokenizer.pad_token = tokenizer.unk_token
     
     if tokenizer.eos_token_id != model.config.eos_token_id :
-         print("Error tokenizer.eos_token_id not equals model ",tokenizer.eos_token_id,model.config.eos_token_id)
+         logging.info("Error tokenizer.eos_token_id not equals model ",tokenizer.eos_token_id,model.config.eos_token_id)
          exit(-1)
     if tokenizer.eos_token_id !=2 or   tokenizer.bos_token_id!=1:
-          print("Error tokenizer.bos_token_id or bos_token_id eror, should 1 and 2,cur ",tokenizer.eos_token_id,model.config.eos_token_id)
+          logging.info("Error tokenizer.bos_token_id or bos_token_id eror, should 1 and 2,cur ",tokenizer.eos_token_id,model.config.eos_token_id)
           exit(-1)           
             
     if tokenizer.pad_token_id != model.config.pad_token_id :
-         print("warn tokenizer.pad_token_id not equals model ",tokenizer.pad_token_id,model.config.pad_token_id," set model token to tokenizer token to fix it")
+         logging.info("warn tokenizer.pad_token_id not equals model ",tokenizer.pad_token_id,model.config.pad_token_id," set model token to tokenizer token to fix it")
          model.config.pad_token_id =tokenizer.pad_token_id      
 
 
@@ -71,10 +58,7 @@ class DataCollatorForCausalLM(object):
     tokenizer: transformers.PreTrainedTokenizer
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        #print("train batch inputs ,len : ",len(instances))
-        input_ids = [instance['input_ids'] for instance in instances] 
-        labels = [instance['labels'] for instance in instances]
-        #print("type input_ids ",type(input_ids),input_ids)
+        input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
@@ -96,19 +80,16 @@ class SupervisedDataset(Dataset):
         else:
             dataset = load_dataset(self.data_path)
         
-        #dataset=format_dataset(dataset)
-        # Split train/eval, reduce size
-
         train_dataset = dataset['train']
         if max_train_samples is not None and len(train_dataset) > max_train_samples:
                 train_dataset = train_dataset.select(range(max_train_samples))
-        print("train data size ",len(train_dataset))
-
+        logging.info(f'train data size {len(train_dataset)}')
         logging.info("Tokenizing inputs... This may take some time...")
         input_ids_all=[]
         lables_all=[]
         for example in train_dataset :
-            source,target=prompt.get_templated_source_target(template,example,tokenizer)    
+            source,target=prompt.get_templated_source_target(template,example,tokenizer) 
+             
             # Tokenize
             tokenized_source = tokenizer.__call__(
                 source,
@@ -132,6 +113,7 @@ class SupervisedDataset(Dataset):
             
             input_ids_all.append(input_ids)
             lables_all.append(labels)
+            #print(input_ids)
             #print("labels ",labels)            
         
         self.input_ids = input_ids_all
@@ -141,12 +123,14 @@ class SupervisedDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        return dict(input_ids=self.input_ids[i], labels=self.labels[i])
+        rest=dict(input_ids=self.input_ids[i], labels=self.labels[i])
+        #print(rest)
+        return rest
        
   
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
+        logging.info('Saving PEFT checkpoint...')
         checkpoint_folder=""
         if state.best_model_checkpoint is not None:
             checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
@@ -158,7 +142,7 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
         if os.path.exists(pytorch_model_path):
             os.remove(pytorch_model_path)
-        print("save path ",pytorch_model_path)
+        logging.info("save path ",pytorch_model_path)
 
 
     def on_save(self, args, state, control, **kwargs):
@@ -194,6 +178,7 @@ def train(
     target_max_len: int = 1024,
     train_on_input:bool =False,
     max_train_samples:int=None,
+    optim:str="paged_adamw_32bit",
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
@@ -211,9 +196,9 @@ def train(
 ):
     major, minor = torch.cuda.get_device_capability()
     if torch.cuda.is_bf16_supported():
-            print('='*80)
-            print('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
-            print('='*80)
+            logging.info('='*80)
+            logging.info('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
+            logging.info('='*80)
             if bf16 is None:
                 bf16 =True
     
@@ -230,7 +215,7 @@ def train(
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
     
     
-    print(
+    logging.info(
             f"Training Alpaca-LoRA model with params:\n"
             f"base_model: {base_model}\n"
             f"data_path: {data_path}\n"
@@ -251,7 +236,9 @@ def train(
             f"lora_target_modules: {lora_target_modules}\n"
             f"train on input part: {train_on_input}\n"
             f"group_by_length: {group_by_length}\n"
-            f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
+            f"resume_from_checkpoint: {resume_from_checkpoint}\n"
+            f"optim: {optim}\n"
+           
         )
 
     
@@ -271,11 +258,11 @@ def train(
     check_and_fix_special_tokens(tokenizer,model)
     train_dataset=SupervisedDataset(template,tokenizer,source_max_len,target_max_len,train_on_input,data_path,max_train_samples)
     data_collator=DataCollatorForCausalLM(tokenizer)
-    model.gradient_checkpointing_enable()
-    
+    if gradient_checkpointing:
+       model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
     #model = prepare_model_for_kbit_training(model)
-    print("train model \n",model)
+    logging.info(f"train model \n {model}")
     config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -295,10 +282,10 @@ def train(
             )  # only LoRA model - LoRA config above has to fit
         # The two files above have a different name depending on how they were saved, but are actually the same.
         if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
+            logging.info(f"Restarting from {checkpoint_name}")
             model = PeftModel.from_pretrained(model, join(checkpoint_name, 'adapter_model'), is_trainable=True)
         else:
-            print(f"Checkpoint {checkpoint_name} not found,no load ")
+            logging.info(f"Checkpoint {checkpoint_name} not found,no load ")
             model = get_peft_model(model, config)
     else:
         model = get_peft_model(model, config)
@@ -310,11 +297,10 @@ def train(
         model.is_parallelizable = True
         model.model_parallel = True
     
-    
     trainer = transformers.Trainer(
         model=model,
-        data_collator=data_collator,
         train_dataset=train_dataset,
+        data_collator=data_collator,
         #eval_dataset=data_module['eval_dataset'],
         args=transformers.TrainingArguments(
             per_device_train_batch_size=micro_batch_size,
@@ -325,7 +311,6 @@ def train(
             learning_rate=learning_rate,
             bf16=bf16,
             logging_steps=10,
-            optim="paged_adamw_32bit",
             evaluation_strategy="no",
             save_strategy="steps",
             eval_steps=100 ,
@@ -336,21 +321,26 @@ def train(
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
             gradient_checkpointing=gradient_checkpointing,
-            report_to=None
+            report_to=None,
+            optim=optim
 
         ),
         callbacks=[SavePeftModelCallback]
     )
     model.config.use_cache = False
+    logging.info(f"DataLoad :{trainer.get_train_dataloader()}")
+    
     trainer.train()
 
     model.save_pretrained(output_dir)
 
-    print(
+    logging.info(
         "\n If there's a warning about missing keys above, please disregard :)"
     )
             
 
 
 if __name__ == "__main__":
+    #Creating and Configuring Logger
+    logging.basicConfig(level=logging.INFO)
     fire.Fire(train)

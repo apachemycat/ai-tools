@@ -1,0 +1,11 @@
+TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=0  python src/panyun/lora.py \
+--base_model /models/vicuna-7b-v1.3  \
+--data_path data/test-instruct.json  \
+--source_max_len 256 \
+--target_max_len  512  \
+--template ALPACA_PROMP \
+--gradient_accumulation_steps 4  \
+--micro_batch_size 4  \
+--num_epochs 3  \
+--output_dir /models/vicuna-7b-delta-wzh  \
+--lora_target_modules '[q_proj,k_proj,v_proj,o_proj]'
