@@ -12,7 +12,7 @@ import torch
 import prompt
 import transformers
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer,LlamaTokenizerFast
+from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer,LlamaTokenizerFast,BitsAndBytesConfig
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -29,11 +29,14 @@ def check_and_fix_special_tokens(
     model: transformers.PreTrainedModel,
 ):
     logging.info(f" token class ,tokens vocab :{len(tokenizer.get_vocab())}\n {tokenizer}")
+    logging.info(f'{tokenizer.all_special_tokens=}')
     default_pad = "[PAD]"
     default_pad=   default_pad if tokenizer.pad_token is None else tokenizer.pad_token     
     if len(tokenizer.get_vocab())==32000:
        added=tokenizer.add_special_tokens({'pad_token': default_pad})
-       logging.info(f"add pad token because tokenizer size is {len(tokenizer.get_vocab())},added={added}") 
+       logging.info(f"add pad token because tokenizer size is 32000,added={added}") 
+       if added>0:
+           model.resize_token_embeddings(len(tokenizer))
     logging.info(f'{tokenizer.bos_token=} ,bos_token_id={tokenizer.bos_token_id}')
     logging.info(f'{tokenizer.eos_token=} ,eos_token_id={tokenizer.eos_token_id}')
     logging.info(f'{tokenizer.pad_token=} ,pad_token_id={tokenizer.pad_token_id}')
@@ -49,7 +52,7 @@ def check_and_fix_special_tokens(
           exit(-1)           
             
     if tokenizer.pad_token_id != model.config.pad_token_id :
-         logging.info("warn tokenizer.pad_token_id not equals model ",tokenizer.pad_token_id,model.config.pad_token_id," set model token to tokenizer token to fix it")
+         logging.info(f"warn tokenizer.pad_token_id not equals model  {tokenizer.pad_token_id},{model.config.pad_token_id},set model token to tokenizer token to fix it")
          model.config.pad_token_id =tokenizer.pad_token_id      
 
 
@@ -59,9 +62,10 @@ class DataCollatorForCausalLM(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
+        #print(input_ids)
+        #print(labels)
+        #exit(-3)
+        input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
         return dict(
             input_ids=input_ids,
@@ -107,10 +111,11 @@ class SupervisedDataset(Dataset):
             )
             # Build the input and labels for causal LM
             input_ids=torch.cat((tokenized_source.input_ids[0] , tokenized_target.input_ids[0]),dim=0)
-            labels = copy.deepcopy(input_ids)
+            len_source=len(tokenized_source.input_ids[0])
             if not train_on_input:
-               labels[:len(tokenized_source.input_ids[0])] = IGNORE_INDEX
-            
+               labels=torch.cat((torch.tensor([IGNORE_INDEX for _ in range(len_source)]) , copy.deepcopy(tokenized_target.input_ids[0])),dim=0)
+            else:
+               labels=copy.deepcopy(input_ids)
             input_ids_all.append(input_ids)
             lables_all.append(labels)
             #print(input_ids)
@@ -142,7 +147,7 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
         if os.path.exists(pytorch_model_path):
             os.remove(pytorch_model_path)
-        logging.info("save path ",pytorch_model_path)
+        logging.info(f"save path  {pytorch_model_path}")
 
 
     def on_save(self, args, state, control, **kwargs):
@@ -171,7 +176,11 @@ def train(
     gradient_accumulation_steps:int=4,
     micro_batch_size: int = 4,
     num_epochs: int = 3,
-    learning_rate: float = 3e-4,
+    save_steps:int = 100,
+    learning_rate: float = 0.0002,
+    lr_scheduler_type:str ="constant",
+    weight_decay:float=0.0,
+    max_grad_norm: float =0.3,
     warmup_ratio: float =0.03,
     warmup_steps: int =100,
     source_max_len: int = 128,
@@ -182,8 +191,8 @@ def train(
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    gradient_checkpointing = True,
+    lora_dropout: float = 0.0,
+    gradient_checkpointing :bool= True,
     lora_target_modules: List[str] = [
        "q_proj","v_proj","k_proj","o_proj","gate_proj","down_proj","up_proj"
     ],
@@ -191,7 +200,10 @@ def train(
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
 
     resume_from_checkpoint: str = None,  # either training train_on_sourcecheckpoint or final adapter
-    bf16:bool =False
+    load_in_8bit =False,
+    load_in_4bit=False,
+    bf16:bool = None,
+    fp16:bool = None,
 
 ):
     major, minor = torch.cuda.get_device_capability()
@@ -200,9 +212,14 @@ def train(
             logging.info('Your GPU supports bfloat16, you can accelerate training with the argument --bf16')
             logging.info('='*80)
             if bf16 is None:
+                print("auto using bfloat16 to accelerate training")
                 bf16 =True
-    
-
+    else:
+        logging.info("Your GPU doesn't support bfloat16 ..")
+        if fp16 is None:
+            print("auto using float16 and float 32 mix train to speed training")
+            fp16 =True        
+    fp16= False if bf16 else fp16     
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
@@ -224,7 +241,11 @@ def train(
             f"micro_batch_size: {micro_batch_size}\n"
             f"gradient_accumulation_steps {gradient_accumulation_steps}\n"
             f"num_epochs: {num_epochs}\n"
+            f"save_steps: {save_steps}\n"
+            f"weight_decay: {weight_decay}\n"
+            f"max_grad_norm: {max_grad_norm}\n"
             f"learning_rate: {learning_rate}\n"
+            f"lr_scheduler_type: {lr_scheduler_type}\n"
             f"warmup_ratio: {warmup_ratio}\n"
             f"source_max_len: {source_max_len}\n"
             f"target_max_len: {target_max_len}\n"
@@ -238,13 +259,26 @@ def train(
             f"group_by_length: {group_by_length}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint}\n"
             f"optim: {optim}\n"
+            f"load_in_8bit: {load_in_8bit}\n"
+            f"load_in_4bit: {load_in_4bit}\n"
+            f"bf16: {bf16}\n"
+            f"fp16: {fp16}\n"
+            
+            
            
         )
-
     
+    bnb_config =None if load_in_4bit==False and load_in_8bit==False else BitsAndBytesConfig(
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+        bnb_4bit_use_double_quant=True,# 嵌套量化，每个参数可以多节省0.4位
+        bnb_4bit_quant_type="nf4",#  NF4（normalized float）或纯FP4量化 博客说推荐NF4
+        bnb_4bit_compute_dtype=torch.bfloat16
+)
+
     model = AutoModelForCausalLM.from_pretrained(
             base_model,
-            load_in_8bit=True,
+            quantization_config=bnb_config,
             device_map=device_map,
             trust_remote_code=True
         )
@@ -261,7 +295,8 @@ def train(
     if gradient_checkpointing:
        model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
-    #model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model,use_gradient_checkpointing= gradient_checkpointing)
+
     logging.info(f"train model \n {model}")
     config = LoraConfig(
         r=lora_r,
@@ -309,12 +344,16 @@ def train(
             warmup_steps=warmup_steps,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
+            lr_scheduler_type=lr_scheduler_type,
+            weight_decay=weight_decay,
+            max_grad_norm=max_grad_norm,
             bf16=bf16,
+            fp16=fp16,
             logging_steps=10,
             evaluation_strategy="no",
             save_strategy="steps",
             eval_steps=100 ,
-            save_steps=100,
+            save_steps=save_steps,
             output_dir=output_dir,
             save_total_limit=3,
             load_best_model_at_end=False,
@@ -328,12 +367,10 @@ def train(
         callbacks=[SavePeftModelCallback]
     )
     model.config.use_cache = False
-    logging.info(f"DataLoad :{trainer.get_train_dataloader()}")
-    
+    model = torch.compile(model,mode="max-autotune")
+    #logging.info(f"DataLoad :{str(trainer.get_train_dataloader())}")
     trainer.train()
-
     model.save_pretrained(output_dir)
-
     logging.info(
         "\n If there's a warning about missing keys above, please disregard :)"
     )
