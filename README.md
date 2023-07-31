@@ -28,6 +28,36 @@ template是Prompt模板，默认是ALPACA_PROMP，可以在代码prompt.py里增
 gradient_accumulation_steps与micro_batch_size是影响内存的最重要两个参数，如果显卡内存大，训练数据比较短，可以增加这两个参数，
 特别是micro_batch_size，它表示一次训练多少条数据，gradient_accumulation_steps表示累计多少个micro_batch_size计算一次梯度，也是省内存
 
+1 标准Lora训练命令
+cd %panyun%
+
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:24 \
+TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=0  \
+python src/panyun/lora.py \
+--base_model /models/llama-2-13b-hf \
+ --output_dir /models/llama-2-13b-hf-delta-kem  \
+ --data_path data/test-instruct.json \
+ --learning_rate: 0.0001 \
+ --fp16 True \
+ --source_max_len 512 \
+ --target_max_len 1024 \
+ --gradient_accumulation_steps 8 \
+ --micro_batch_size 32\
+ --lora_r 8   \
+ --save_steps 50   \
+ --lora_target_modules '[q_proj,v_proj,k_proj]'
+
+2 如果要用8bit量化来节省内存，则增加参数
+--load_in_8bit True
+
+3 如果要用谷歌的Lion优化器，可增加下面的参数 
+--optim=paged_lion_32bit 或者 paged_lion_8bit
+
+标准qlora训练命令
+增加参数 
+--load_in_4bit True
+
+
 
 
 
