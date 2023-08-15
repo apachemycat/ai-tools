@@ -7,11 +7,13 @@ from torch.nn.utils.rnn import pad_sequence
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
 from torch.utils.data import Dataset
+#from optimum.bettertransformer import BetterTransformer
 import fire
 import torch
 import prompt
 import transformers
 from datasets import load_dataset
+from peft.tuners.lora import LoraLayer
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer,LlamaTokenizerFast,BitsAndBytesConfig
 from peft import (
     LoraConfig,
@@ -30,13 +32,26 @@ def check_and_fix_special_tokens(
 ):
     logging.info(f" token class ,tokens vocab :{len(tokenizer.get_vocab())}\n {tokenizer}")
     logging.info(f'{tokenizer.all_special_tokens=}')
-    default_pad = "[PAD]"
-    default_pad=   default_pad if tokenizer.pad_token is None else tokenizer.pad_token     
-    if len(tokenizer.get_vocab())==32000:
-       added=tokenizer.add_special_tokens({'pad_token': default_pad})
-       logging.info(f"add pad token because tokenizer size is 32000,added={added}") 
-       if added>0:
-           model.resize_token_embeddings(len(tokenizer))
+    if tokenizer.pad_token is None:
+        logging.warn("model no padding token ,set to eos pad ")
+        tokenizer.pad_token=tokenizer.eos_token
+        tokenizer.pad_token_id=tokenizer.eos_token_id
+        
+ 
+    # if len(tokenizer.get_vocab())==32000:
+    #    num_new_tokens=tokenizer.add_special_tokens({'pad_token': default_pad})
+    #    logging.info(f"add pad token because tokenizer size is 32000,added={num_new_tokens}") 
+    #    if num_new_tokens>0:
+    #        model.resize_token_embeddings(len(tokenizer))
+    #        input_embeddings_data = model.get_input_embeddings().weight.data
+    #        output_embeddings_data = model.get_output_embeddings().weight.data
+
+    #        input_embeddings_avg = input_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
+    #        output_embeddings_avg = output_embeddings_data[:-num_new_tokens].mean(dim=0, keepdim=True)
+
+    #        input_embeddings_data[-num_new_tokens:] = input_embeddings_avg
+    #        output_embeddings_data[-num_new_tokens:] = output_embeddings_avg
+    
     logging.info(f'{tokenizer.bos_token=} ,bos_token_id={tokenizer.bos_token_id}')
     logging.info(f'{tokenizer.eos_token=} ,eos_token_id={tokenizer.eos_token_id}')
     logging.info(f'{tokenizer.pad_token=} ,pad_token_id={tokenizer.pad_token_id}')
@@ -52,7 +67,7 @@ def check_and_fix_special_tokens(
           exit(-1)           
             
     if tokenizer.pad_token_id != model.config.pad_token_id :
-         logging.info(f"warn tokenizer.pad_token_id not equals model  {tokenizer.pad_token_id},{model.config.pad_token_id},set model token to tokenizer token to fix it")
+         logging.info(f"warn tokenizer.pad_token_id {tokenizer.pad_token_id} not equals model {model.config.pad_token_id},auto set model token to tokenizer token to fix it")
          model.config.pad_token_id =tokenizer.pad_token_id      
 
 
@@ -178,7 +193,7 @@ def train(
     num_epochs: int = 3,
     save_steps:int = 100,
     learning_rate: float = 0.0002,
-    lr_scheduler_type:str ="constant",
+    lr_scheduler_type:str ="cosine_with_restarts",
     weight_decay:float=0.0,
     max_grad_norm: float =0.3,
     warmup_ratio: float =0.03,
@@ -191,7 +206,7 @@ def train(
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
-    lora_dropout: float = 0.0,
+    lora_dropout: float = 0.05,
     gradient_checkpointing :bool= True,
     lora_target_modules: List[str] = [
        "q_proj","v_proj","k_proj","o_proj","gate_proj","down_proj","up_proj"
@@ -204,8 +219,13 @@ def train(
     load_in_4bit=False,
     bf16:bool = None,
     fp16:bool = None,
+    off_load_cpu =False
 
 ):
+    seed=1000
+     # Set the seeds for reproducibility
+    torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
     major, minor = torch.cuda.get_device_capability()
     if torch.cuda.is_bf16_supported():
             logging.info('='*80)
@@ -225,6 +245,7 @@ def train(
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
             
     #device_map = "auto"
+    device_map ="auto"
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
     if ddp:
@@ -263,6 +284,8 @@ def train(
             f"load_in_4bit: {load_in_4bit}\n"
             f"bf16: {bf16}\n"
             f"fp16: {fp16}\n"
+            f"off_load_cpu: {off_load_cpu}\n"
+            
             
             
            
@@ -273,19 +296,36 @@ def train(
         load_in_8bit=load_in_8bit,
         bnb_4bit_use_double_quant=True,# 嵌套量化，每个参数可以多节省0.4位
         bnb_4bit_quant_type="nf4",#  NF4（normalized float）或纯FP4量化 博客说推荐NF4
-        bnb_4bit_compute_dtype=torch.bfloat16
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        load_in_8bit_fp32_cpu_offload=off_load_cpu,
+        llm_int8_enable_fp32_cpu_offload=off_load_cpu
 )
-
+    if off_load_cpu :
+        device_map={'': 'cuda'}
+        device_map["lm_head"] ="cpu"
+        device_map["embed_tokens"] ="cpu"
+        
+    
+    compute_dtype = (torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32))
     model = AutoModelForCausalLM.from_pretrained(
             base_model,
             quantization_config=bnb_config,
             device_map=device_map,
-            trust_remote_code=True
+            trust_remote_code=True,
+            torch_dtype=(torch.float32 if fp16 else (torch.bfloat16 if bf16 else torch.float32)),
         )
+    
+    #As part of PyTorch 2.0 release, an accelerated implementation of the attention mechanism as part of the “Better Transformer” project (and known in PyTorch as Accelerated Transformers) 
+    # has been added natively into PyTorch as torch.nn.functional.scaled_dot_product_attention. This implementation leverages fused kernels from FlashAttention and Memory-efficient attention, 
+    # and supports both training and inference.
+    #model = BetterTransformer.transform(model)
+
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         base_model,
-        padding_side="right"
+        padding_side="right",
+        use_fast=True,
+        legacy=False
 
     )
     #print("origin model\n",model)
@@ -325,6 +365,18 @@ def train(
     else:
         model = get_peft_model(model, config)
     
+    
+    for name, module in model.named_modules():
+        if isinstance(module, LoraLayer):
+            #logging.info(f"find Lora layer {name} ")
+            if bf16:
+                module = module.to(torch.bfloat16)
+        if 'norm' in name:
+            module = module.to(torch.float32)
+        if 'lm_head' in name or 'embed_tokens' in name:
+            if hasattr(module, 'weight'):
+                if bf16 and module.weight.dtype == torch.float32:
+                    module = module.to(torch.bfloat16)    
     #print("peft train model \n",model)
     model.print_trainable_parameters()
     if not ddp and torch.cuda.device_count() > 1:

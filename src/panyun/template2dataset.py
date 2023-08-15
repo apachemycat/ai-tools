@@ -180,7 +180,7 @@ def gen_all_template_params(single:dict,multi:dict):
 def main():
  templateDir= 'data/template'
  tempateFileName='kem-app-yaml.template'
- tempateParamFile='kem-app-yaml.template2.json'
+ tempateParamFile='kem-app-yaml.template.json'
  datatoutFile="output.txt"
  template = Template(filename=templateDir+"/"+tempateFileName,input_encoding="utf-8")
  singleParams={}
